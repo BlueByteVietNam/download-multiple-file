@@ -63,7 +63,7 @@ func main() {
 	http.HandleFunc("/create", handleCreate)
 	http.HandleFunc("/download/", handleDownload)
 
-	port := ":8080"
+	port := ":6001"
 	log.Printf("Server running on %s (Session TTL: %v, HTTP Timeout: %v)", port, SessionTTL, HTTPTimeout)
 	log.Fatal(http.ListenAndServe(port, nil))
 }
