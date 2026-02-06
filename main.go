@@ -209,13 +209,14 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Xử lý trùng tên
-		if count, exists := usedNames[fileName]; exists {
+		// Xử lý trùng tên - lưu tên gốc để đếm chính xác
+		originalName := fileName
+		if count, exists := usedNames[originalName]; exists {
 			ext := path.Ext(fileName)
 			base := fileName[:len(fileName)-len(ext)]
 			fileName = fmt.Sprintf("%s_%d%s", base, count+1, ext)
 		}
-		usedNames[fileName]++
+		usedNames[originalName]++
 
 		log.Printf("Streaming: %s -> %s", fileURL, fileName)
 
