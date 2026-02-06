@@ -132,7 +132,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	resp := DownloadResponse{
-		DownloadURL: fmt.Sprintf("http://%s/download/%s", r.Host, token),
+		DownloadURL: fmt.Sprintf("https://%s/download/%s", r.Host, token),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
