@@ -54,14 +54,33 @@ var (
 	}
 )
 
+// ============== CORS MIDDLEWARE ==============
+
+func enableCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Handle preflight OPTIONS request
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // ============== MAIN ==============
 
 func main() {
 	// Khởi động cleanup goroutine
 	go cleanupExpiredSessions()
 
-	http.HandleFunc("/create", handleCreate)
-	http.HandleFunc("/download/", handleDownload)
+	http.HandleFunc("/create", enableCORS(handleCreate))
+	http.HandleFunc("/download/", enableCORS(handleDownload))
 
 	port := ":6001"
 	log.Printf("Server running on %s (Session TTL: %v, HTTP Timeout: %v)", port, SessionTTL, HTTPTimeout)
