@@ -21,8 +21,8 @@ import (
 const (
 	SessionTTL      = 1 * time.Hour    // Session hết hạn sau 1 giờ
 	CleanupInterval = 5 * time.Minute  // Cleanup mỗi 5 phút
-	HTTPTimeout     = 5 * time.Minute  // Timeout cho mỗi HTTP request
-	DownloadTimeout = 30 * time.Minute // Timeout cho toàn bộ download
+	HTTPTimeout     = 60 * time.Minute  // Timeout cho mỗi HTTP request
+	DownloadTimeout = 60 * time.Minute // Timeout cho toàn bộ download
 )
 
 // ============== TYPES ==============
