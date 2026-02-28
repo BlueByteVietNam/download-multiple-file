@@ -4,13 +4,16 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,10 +22,21 @@ import (
 
 // ============== CONFIG ==============
 const (
-	SessionTTL      = 1 * time.Hour    // Session hết hạn sau 1 giờ
-	CleanupInterval = 5 * time.Minute  // Cleanup mỗi 5 phút
-	HTTPTimeout     = 5 * time.Minute  // Timeout cho mỗi HTTP request
-	DownloadTimeout = 30 * time.Minute // Timeout cho toàn bộ download
+	SessionTTL      = 1 * time.Hour   // Session hết hạn sau 1 giờ
+	CleanupInterval = 5 * time.Minute // Cleanup mỗi 5 phút
+
+	// Transport-level timeouts (chỉ timeout connect/header, KHÔNG timeout body)
+	ConnectTimeout        = 30 * time.Second // TCP connect timeout
+	TLSHandshakeTimeout   = 15 * time.Second // TLS handshake timeout
+	ResponseHeaderTimeout = 30 * time.Second // Chờ response header
+
+	// Download timeout tính động: base + perFile * numFiles
+	DownloadTimeoutBase    = 5 * time.Minute // Base timeout
+	DownloadTimeoutPerFile = 3 * time.Minute // Thêm mỗi file
+
+	// Retry config
+	MaxRetries    = 3
+	RetryBaseWait = 1 * time.Second // Backoff: 1s, 2s, 4s
 )
 
 // ============== TYPES ==============
@@ -48,9 +62,17 @@ var (
 	sessions = make(map[string]*Session)
 	mu       sync.RWMutex
 
-	// HTTP client với timeout
+	// HTTP client: chỉ timeout connect/header, KHÔNG timeout đọc body
+	// → video lớn stream chậm cũng không bị cắt
 	httpClient = &http.Client{
-		Timeout: HTTPTimeout,
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: ConnectTimeout}).DialContext,
+			TLSHandshakeTimeout:   TLSHandshakeTimeout,
+			ResponseHeaderTimeout: ResponseHeaderTimeout,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+		},
 	}
 )
 
@@ -83,7 +105,8 @@ func main() {
 	http.HandleFunc("/download/", enableCORS(handleDownload))
 
 	port := ":6001"
-	log.Printf("Server running on %s (Session TTL: %v, HTTP Timeout: %v)", port, SessionTTL, HTTPTimeout)
+	log.Printf("Server running on %s (Session TTL: %v, Connect: %v, Header: %v)",
+		port, SessionTTL, ConnectTimeout, ResponseHeaderTimeout)
 	log.Fatal(http.ListenAndServe(port, nil))
 }
 
@@ -190,22 +213,30 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	usedNames := make(map[string]int)
 
-	// Context với timeout cho toàn bộ download
-	ctx, cancel := context.WithTimeout(r.Context(), DownloadTimeout)
+	// Dynamic timeout: base + perFile * numFiles
+	downloadTimeout := DownloadTimeoutBase + DownloadTimeoutPerFile*time.Duration(len(session.Files))
+	ctx, cancel := context.WithTimeout(r.Context(), downloadTimeout)
 	defer cancel()
 
-	for _, fileURL := range session.Files {
+	log.Printf("Starting download for token %s: %d files, timeout: %v", token, len(session.Files), downloadTimeout)
+
+	successCount := 0
+	failCount := 0
+
+	for i, fileURL := range session.Files {
 		// Check context trước mỗi file
 		select {
 		case <-ctx.Done():
-			log.Printf("Download timeout for token: %s", token)
+			log.Printf("Download timeout for token %s after %d/%d files", token, i, len(session.Files))
 			return
 		default:
 		}
 
-		fileName, resp, err := getOriginalFileName(ctx, fileURL)
+		// Fetch với retry
+		fileName, resp, err := fetchWithRetry(ctx, fileURL, MaxRetries)
 		if err != nil {
-			log.Printf("Error fetching %s: %v", fileURL, err)
+			log.Printf("[%d/%d] FAILED %s: %v", i+1, len(session.Files), fileURL, err)
+			failCount++
 			continue
 		}
 
@@ -218,14 +249,16 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		usedNames[originalName]++
 
-		log.Printf("Streaming: %s -> %s", fileURL, fileName)
+		log.Printf("[%d/%d] Streaming: %s -> %s", i+1, len(session.Files), fileURL, fileName)
 
 		if err := streamToZip(zipWriter, resp, fileName); err != nil {
-			log.Printf("Error streaming: %v", err)
+			log.Printf("[%d/%d] Error streaming %s: %v", i+1, len(session.Files), fileName, err)
 			resp.Body.Close()
+			failCount++
 			continue
 		}
 		resp.Body.Close()
+		successCount++
 	}
 
 	// Xóa session sau khi download xong
@@ -233,7 +266,64 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	delete(sessions, token)
 	mu.Unlock()
 
-	log.Printf("Download completed for token: %s", token)
+	log.Printf("Download completed for token %s: %d success, %d failed out of %d total",
+		token, successCount, failCount, len(session.Files))
+}
+
+// ============== RETRY ==============
+
+func fetchWithRetry(ctx context.Context, fileURL string, maxRetries int) (string, *http.Response, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Backoff trước retry (không backoff lần đầu)
+		if attempt > 0 {
+			backoff := RetryBaseWait * time.Duration(1<<(attempt-1)) // 1s, 2s, 4s
+			log.Printf("Retry %d/%d for %s (waiting %v)", attempt, maxRetries, fileURL, backoff)
+
+			select {
+			case <-ctx.Done():
+				return "", nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		fileName, resp, err := getOriginalFileName(ctx, fileURL)
+		if err == nil {
+			return fileName, resp, nil
+		}
+
+		lastErr = err
+
+		// Không retry lỗi 4xx (client error) — chỉ retry lỗi recoverable
+		if !isRetryableError(err) {
+			return "", nil, err
+		}
+	}
+
+	return "", nil, fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
+}
+
+// isRetryableError kiểm tra lỗi có nên retry không
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Context cancelled/deadline → không retry
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Lỗi 4xx → không retry (404, 403, etc.)
+	if strings.Contains(errStr, "bad status 4") {
+		return false
+	}
+
+	// Mọi lỗi khác (network, timeout, 5xx) → retry
+	return true
 }
 
 // ============== HELPERS ==============
