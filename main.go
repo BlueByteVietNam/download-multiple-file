@@ -238,6 +238,76 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 
 // ============== HELPERS ==============
 
+func extractFilenameFromHeader(header string) string {
+	// Thử pattern: filename*=UTF-8''encoded_filename (RFC 5987)
+	if idx := indexOf(header, "filename*=UTF-8''"); idx >= 0 {
+		start := idx + len("filename*=UTF-8''")
+		end := indexOfAny(header[start:], []string{";", "\n", "\r"})
+		if end < 0 {
+			end = len(header) - start
+		}
+		encoded := header[start : start+end]
+		if decoded, err := url.QueryUnescape(encoded); err == nil {
+			return decoded
+		}
+	}
+
+	// Thử pattern: filename="..." (có thể có dấu " bên trong)
+	if idx := indexOf(header, `filename="`); idx >= 0 {
+		start := idx + len(`filename="`)
+		// Tìm dấu " cuối cùng trước ; hoặc end of string
+		remaining := header[start:]
+		var end int
+
+		// Tìm dấu " cuối (backwards)
+		lastQuote := lastIndexOf(remaining, `"`)
+		if lastQuote > 0 {
+			end = lastQuote
+		} else {
+			// Không tìm thấy dấu " đóng, lấy đến ; hoặc end
+			end = indexOfAny(remaining, []string{";", "\n", "\r"})
+			if end < 0 {
+				end = len(remaining)
+			}
+		}
+
+		if end > 0 {
+			return remaining[:end]
+		}
+	}
+
+	return ""
+}
+
+func indexOf(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
+func lastIndexOf(s, substr string) int {
+	for i := len(s) - len(substr); i >= 0; i-- {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
+func indexOfAny(s string, substrs []string) int {
+	minIdx := -1
+	for _, substr := range substrs {
+		idx := indexOf(s, substr)
+		if idx >= 0 && (minIdx < 0 || idx < minIdx) {
+			minIdx = idx
+		}
+	}
+	return minIdx
+}
+
 func getOriginalFileName(ctx context.Context, fileURL string) (string, *http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
 	if err != nil {
@@ -261,6 +331,12 @@ func getOriginalFileName(ctx context.Context, fileURL string) (string, *http.Res
 			if filename, ok := params["filename"]; ok && filename != "" {
 				return filename, resp, nil
 			}
+		}
+
+		// Fallback: parse manually nếu mime.ParseMediaType fail
+		// Extract filename từ pattern: filename="..." hoặc filename*=UTF-8''...
+		if filename := extractFilenameFromHeader(cd); filename != "" {
+			return filename, resp, nil
 		}
 	}
 
