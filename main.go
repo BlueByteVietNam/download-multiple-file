@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"sync"
 	"time"
@@ -23,6 +24,8 @@ const (
 	CleanupInterval = 5 * time.Minute  // Cleanup mỗi 5 phút
 	HTTPTimeout     = 60 * time.Minute  // Timeout cho mỗi HTTP request
 	DownloadTimeout = 60 * time.Minute // Timeout cho toàn bộ download
+	MaxWorkers      = 10               // Số goroutine download song song
+	MaxPrefetch     = 15               // Tối đa temp files trên disk cùng lúc
 )
 
 // ============== TYPES ==============
@@ -40,6 +43,18 @@ type Session struct {
 	Files     []string
 	ZipName   string
 	CreatedAt time.Time
+}
+
+type FileTask struct {
+	Index int
+	URL   string
+}
+
+type FileResult struct {
+	Index    int
+	FileName string
+	TempPath string
+	Err      error
 }
 
 // ============== GLOBAL STATE ==============
@@ -181,6 +196,15 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tạo temp directory cho session
+	tempDir, err := os.MkdirTemp("", "zip-download-*")
+	if err != nil {
+		log.Printf("Failed to create temp dir: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(tempDir)
+
 	// Set headers
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", session.ZipName))
@@ -188,28 +212,96 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	zipWriter := zip.NewWriter(w)
 	defer zipWriter.Close()
 
-	usedNames := make(map[string]int)
-
 	// Context với timeout cho toàn bộ download
 	ctx, cancel := context.WithTimeout(r.Context(), DownloadTimeout)
 	defer cancel()
 
-	for _, fileURL := range session.Files {
-		// Check context trước mỗi file
+	fileCount := len(session.Files)
+	results := make([]*FileResult, fileCount)
+	done := make([]chan struct{}, fileCount)
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+
+	// Semaphore để giới hạn số temp files trên disk
+	sem := make(chan struct{}, MaxPrefetch)
+
+	// Work channel cho dispatcher → workers
+	tasks := make(chan FileTask)
+
+	// Dispatcher goroutine: gửi tasks vào work channel, acquire semaphore trước
+	go func() {
+		defer close(tasks)
+		for i, fileURL := range session.Files {
+			select {
+			case sem <- struct{}{}: // Acquire semaphore
+			case <-ctx.Done():
+				// Signal done cho các tasks còn lại
+				for j := i; j < fileCount; j++ {
+					results[j] = &FileResult{Index: j, Err: ctx.Err()}
+					close(done[j])
+				}
+				return
+			}
+
+			select {
+			case tasks <- FileTask{Index: i, URL: fileURL}:
+			case <-ctx.Done():
+				<-sem // Release semaphore vừa acquire
+				for j := i; j < fileCount; j++ {
+					results[j] = &FileResult{Index: j, Err: ctx.Err()}
+					close(done[j])
+				}
+				return
+			}
+		}
+	}()
+
+	// Worker pool
+	var wg sync.WaitGroup
+	for w := 0; w < MaxWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				result := downloadToTemp(ctx, task, tempDir)
+				results[task.Index] = result
+				close(done[task.Index])
+			}
+		}()
+	}
+
+	// Đảm bảo workers kết thúc trong background
+	go func() {
+		wg.Wait()
+	}()
+
+	// ZIP writer loop: chờ file theo thứ tự, ghi vào ZIP
+	usedNames := make(map[string]int)
+	for i := 0; i < fileCount; i++ {
+		// Chờ file i hoàn thành
 		select {
+		case <-done[i]:
 		case <-ctx.Done():
 			log.Printf("Download timeout for token: %s", token)
 			return
-		default:
 		}
 
-		fileName, resp, err := getOriginalFileName(ctx, fileURL)
-		if err != nil {
-			log.Printf("Error fetching %s: %v", fileURL, err)
+		result := results[i]
+		if result.Err != nil {
+			log.Printf("Error downloading file %d: %v", i, result.Err)
+			// Release semaphore nếu không có temp file (error trước khi tạo file)
+			if result.TempPath == "" {
+				select {
+				case <-sem:
+				default:
+				}
+			}
 			continue
 		}
 
-		// Xử lý trùng tên - lưu tên gốc để đếm chính xác
+		// Xử lý trùng tên
+		fileName := result.FileName
 		originalName := fileName
 		if count, exists := usedNames[originalName]; exists {
 			ext := path.Ext(fileName)
@@ -218,14 +310,15 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		usedNames[originalName]++
 
-		log.Printf("Streaming: %s -> %s", fileURL, fileName)
+		log.Printf("Writing to ZIP: %s (file %d/%d)", fileName, i+1, fileCount)
 
-		if err := streamToZip(zipWriter, resp, fileName); err != nil {
-			log.Printf("Error streaming: %v", err)
-			resp.Body.Close()
-			continue
+		if err := streamTempFileToZip(zipWriter, result.TempPath, fileName); err != nil {
+			log.Printf("Error writing to ZIP: %v", err)
 		}
-		resp.Body.Close()
+
+		// Xoá temp file và release semaphore
+		os.Remove(result.TempPath)
+		<-sem
 	}
 
 	// Xóa session sau khi download xong
@@ -233,7 +326,72 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	delete(sessions, token)
 	mu.Unlock()
 
-	log.Printf("Download completed for token: %s", token)
+	log.Printf("Download completed for token: %s (%d files)", token, fileCount)
+}
+
+// ============== CONCURRENT DOWNLOAD HELPERS ==============
+
+func downloadToTemp(ctx context.Context, task FileTask, tempDir string) *FileResult {
+	result := &FileResult{Index: task.Index}
+
+	fileName, resp, err := getOriginalFileName(ctx, task.URL)
+	if err != nil {
+		result.Err = err
+		return result
+	}
+	defer resp.Body.Close()
+
+	result.FileName = fileName
+
+	// Tạo temp file
+	tmpFile, err := os.CreateTemp(tempDir, fmt.Sprintf("file-%d-*", task.Index))
+	if err != nil {
+		result.Err = fmt.Errorf("create temp file: %w", err)
+		return result
+	}
+
+	result.TempPath = tmpFile.Name()
+
+	// Stream response body vào temp file
+	_, err = io.Copy(tmpFile, resp.Body)
+	tmpFile.Close()
+	if err != nil {
+		os.Remove(result.TempPath)
+		result.TempPath = ""
+		result.Err = fmt.Errorf("download to temp: %w", err)
+		return result
+	}
+
+	log.Printf("Downloaded: %s -> %s (file %d)", task.URL, fileName, task.Index)
+	return result
+}
+
+func streamTempFileToZip(zw *zip.Writer, tempPath string, fileName string) error {
+	fi, err := os.Stat(tempPath)
+	if err != nil {
+		return err
+	}
+
+	header := &zip.FileHeader{
+		Name:               fileName,
+		Method:             zip.Store,
+		UncompressedSize64: uint64(fi.Size()),
+	}
+	header.SetModTime(time.Now())
+
+	fileWriter, err := zw.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Open(tempPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = io.Copy(fileWriter, f)
+	return err
 }
 
 // ============== HELPERS ==============
@@ -352,18 +510,3 @@ func getOriginalFileName(ctx context.Context, fileURL string) (string, *http.Res
 	return "file", resp, nil
 }
 
-func streamToZip(zw *zip.Writer, resp *http.Response, fileName string) error {
-	header := &zip.FileHeader{
-		Name:   fileName,
-		Method: zip.Store,
-	}
-	header.SetModTime(time.Now())
-
-	fileWriter, err := zw.CreateHeader(header)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(fileWriter, resp.Body)
-	return err
-}
