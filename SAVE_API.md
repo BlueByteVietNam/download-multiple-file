@@ -16,21 +16,21 @@ GET  /files/{task_id}/xxx.zip       → download ZIP
 
 ```bash
 # 1. Init
-TASK_ID=$(curl -s -X POST http://host/save/init | jq -r '.task_id')
+TASK_ID=$(curl -s -X POST https://muti-download.ytconvert.org/save/init | jq -r '.task_id')
 
 # 2. Add files
-curl -s -X POST http://host/save/add \
+curl -s -X POST https://muti-download.ytconvert.org/save/add \
   -d '{"task_id":"'$TASK_ID'","url":"https://example.com/video1.mp4"}'
 
-curl -s -X POST http://host/save/add \
+curl -s -X POST https://muti-download.ytconvert.org/save/add \
   -d '{"task_id":"'$TASK_ID'","url":"https://example.com/video2.mp4"}'
 
 # 3. Request ZIP
-curl -s -X POST http://host/save/zip \
+curl -s -X POST https://muti-download.ytconvert.org/save/zip \
   -d '{"task_id":"'$TASK_ID'","zip_name":"my_videos.zip"}'
 
 # 4. Poll
-curl -s http://host/save/status/$TASK_ID
+curl -s https://muti-download.ytconvert.org/save/status/$TASK_ID
 # → {"status":"done", "zip_url":"...", "zip_size":123456}
 ```
 
