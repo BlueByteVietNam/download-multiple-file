@@ -64,28 +64,34 @@ type FileResult struct {
 type SaveTaskStatus string
 
 const (
-	StatusProcessing SaveTaskStatus = "processing"
-	StatusDone       SaveTaskStatus = "done"
+	StatusPending    SaveTaskStatus = "pending"    // Đang nhận file từ client
+	StatusZipping    SaveTaskStatus = "zipping"    // Đang tạo ZIP
+	StatusDone       SaveTaskStatus = "done"       // Xong, có link ZIP
 	StatusFailed     SaveTaskStatus = "failed"
 )
 
 type SavedFile struct {
-	Name string `json:"name"`
-	URL  string `json:"url"`
-	Size int64  `json:"size"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	Status string `json:"status"` // "downloading", "done", "failed"
 }
 
 type SaveTask struct {
 	ID          string         `json:"id"`
 	Status      SaveTaskStatus `json:"status"`
 	Total       int            `json:"total"`
-	Completed   int            `json:"completed"`
+	Downloaded  int            `json:"downloaded"`
 	Failed      int            `json:"failed"`
 	Files       []SavedFile    `json:"files,omitempty"`
+	ZipName     string         `json:"zip_name,omitempty"`
+	ZipURL      string         `json:"zip_url,omitempty"`
+	ZipSize     int64          `json:"zip_size,omitempty"`
 	Error       string         `json:"error,omitempty"`
+	Host        string         `json:"-"`
 	CreatedAt   time.Time      `json:"created_at"`
 	CompletedAt *time.Time     `json:"completed_at,omitempty"`
 	mu          sync.Mutex
+	usedNames   map[string]int
 }
 
 // ============== GLOBAL STATE ==============
@@ -94,8 +100,8 @@ var (
 	sessions = make(map[string]*Session)
 	mu       sync.RWMutex
 
-	saveTasks  = make(map[string]*SaveTask)
-	tasksMu    sync.RWMutex
+	saveTasks = make(map[string]*SaveTask)
+	tasksMu   sync.RWMutex
 
 	// HTTP client với timeout
 	httpClient = &http.Client{
@@ -132,12 +138,15 @@ func main() {
 	go cleanupExpiredSessions()
 	go cleanupExpiredTasks()
 
+	// ZIP streaming endpoints (existing)
 	http.HandleFunc("/create", enableCORS(handleCreate))
 	http.HandleFunc("/download/", enableCORS(handleDownload))
 
-	// Async save endpoints
-	http.HandleFunc("/save", enableCORS(handleSave))
-	http.HandleFunc("/status/", enableCORS(handleStatus))
+	// Save-to-server endpoints (new)
+	http.HandleFunc("/save/init", enableCORS(handleSaveInit))
+	http.HandleFunc("/save/add", enableCORS(handleSaveAdd))
+	http.HandleFunc("/save/zip", enableCORS(handleSaveZip))
+	http.HandleFunc("/save/status/", enableCORS(handleSaveStatus))
 
 	// Static file server cho saved files
 	fileServer := http.StripPrefix("/files/", http.FileServer(http.Dir(SavedFilesDir)))
@@ -212,29 +221,20 @@ func cleanupExpiredTasks() {
 
 // ============== SAVE HANDLERS ==============
 
-func handleSave(w http.ResponseWriter, r *http.Request) {
+// POST /save/init — Tạo task mới
+func handleSaveInit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req DownloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if len(req.Files) == 0 {
-		http.Error(w, "No files provided", http.StatusBadRequest)
 		return
 	}
 
 	taskID := uuid.New().String()
 	task := &SaveTask{
 		ID:        taskID,
-		Status:    StatusProcessing,
-		Total:     len(req.Files),
+		Status:    StatusPending,
+		Host:      r.Host,
 		CreatedAt: time.Now(),
+		usedNames: make(map[string]int),
 	}
 
 	// Tạo thư mục cho task
@@ -248,20 +248,264 @@ func handleSave(w http.ResponseWriter, r *http.Request) {
 	saveTasks[taskID] = task
 	tasksMu.Unlock()
 
-	// Bắt đầu download trong background
-	go processDownloadTask(task, req.Files, taskDir, r.Host)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"task_id": taskID,
-		"status":  StatusProcessing,
-		"total":   len(req.Files),
+		"status":  StatusPending,
 	})
 
-	log.Printf("Created save task %s with %d files", taskID, len(req.Files))
+	log.Printf("Created save task %s", taskID)
 }
 
-func handleStatus(w http.ResponseWriter, r *http.Request) {
+// POST /save/add — Client gửi từng URL, server tải background
+func handleSaveAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		TaskID string `json:"task_id"`
+		URL    string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.TaskID == "" || req.URL == "" {
+		http.Error(w, "task_id and url are required", http.StatusBadRequest)
+		return
+	}
+
+	tasksMu.RLock()
+	task, exists := saveTasks[req.TaskID]
+	tasksMu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Task not found", http.StatusNotFound)
+		return
+	}
+
+	task.mu.Lock()
+	if task.Status != StatusPending {
+		task.mu.Unlock()
+		http.Error(w, "Task is no longer accepting files", http.StatusConflict)
+		return
+	}
+	task.Total++
+	fileIndex := len(task.Files)
+	task.Files = append(task.Files, SavedFile{Name: "", Size: 0, Status: "downloading"})
+	task.mu.Unlock()
+
+	// Download trong background
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), DownloadTimeout)
+		defer cancel()
+
+		taskDir := fmt.Sprintf("%s/%s", SavedFilesDir, task.ID)
+
+		fileName, resp, err := getOriginalFileName(ctx, req.URL)
+		if err != nil {
+			log.Printf("Save task %s: failed to download: %v", task.ID, err)
+			task.mu.Lock()
+			task.Failed++
+			task.Files[fileIndex] = SavedFile{Name: "", Status: "failed"}
+			task.mu.Unlock()
+			return
+		}
+
+		// Xử lý trùng tên
+		task.mu.Lock()
+		originalName := fileName
+		if count, exists := task.usedNames[originalName]; exists {
+			ext := path.Ext(fileName)
+			base := fileName[:len(fileName)-len(ext)]
+			fileName = fmt.Sprintf("%s_%d%s", base, count+1, ext)
+		}
+		task.usedNames[originalName]++
+		task.mu.Unlock()
+
+		// Lưu file vào disk
+		filePath := fmt.Sprintf("%s/%s", taskDir, fileName)
+		f, err := os.Create(filePath)
+		if err != nil {
+			resp.Body.Close()
+			log.Printf("Save task %s: failed to create file: %v", task.ID, err)
+			task.mu.Lock()
+			task.Failed++
+			task.Files[fileIndex] = SavedFile{Name: fileName, Status: "failed"}
+			task.mu.Unlock()
+			return
+		}
+
+		written, err := io.Copy(f, resp.Body)
+		f.Close()
+		resp.Body.Close()
+
+		if err != nil {
+			os.Remove(filePath)
+			log.Printf("Save task %s: failed to write file: %v", task.ID, err)
+			task.mu.Lock()
+			task.Failed++
+			task.Files[fileIndex] = SavedFile{Name: fileName, Status: "failed"}
+			task.mu.Unlock()
+			return
+		}
+
+		task.mu.Lock()
+		task.Downloaded++
+		task.Files[fileIndex] = SavedFile{Name: fileName, Size: written, Status: "done"}
+		task.mu.Unlock()
+
+		log.Printf("Save task %s: downloaded %s (%.2f MB)", task.ID, fileName, float64(written)/1024/1024)
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "accepted",
+		"task_id": req.TaskID,
+	})
+}
+
+// POST /save/zip — Client yêu cầu tạo ZIP từ các file đã tải
+func handleSaveZip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		TaskID  string `json:"task_id"`
+		ZipName string `json:"zip_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.TaskID == "" {
+		http.Error(w, "task_id is required", http.StatusBadRequest)
+		return
+	}
+
+	tasksMu.RLock()
+	task, exists := saveTasks[req.TaskID]
+	tasksMu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Task not found", http.StatusNotFound)
+		return
+	}
+
+	zipName := req.ZipName
+	if zipName == "" {
+		zipName = "files.zip"
+	}
+
+	task.mu.Lock()
+	if task.Status != StatusPending {
+		task.mu.Unlock()
+		http.Error(w, "ZIP already requested", http.StatusConflict)
+		return
+	}
+	task.ZipName = zipName
+	task.Status = StatusZipping
+	task.mu.Unlock()
+
+	// Tạo ZIP trong background (chờ tất cả file tải xong trước)
+	go func() {
+		// Chờ tất cả file download xong
+		for {
+			task.mu.Lock()
+			done := task.Downloaded + task.Failed >= task.Total
+			task.mu.Unlock()
+			if done {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		taskDir := fmt.Sprintf("%s/%s", SavedFilesDir, task.ID)
+
+		// Thu thập file thành công
+		task.mu.Lock()
+		var filesToZip []SavedFile
+		for _, f := range task.Files {
+			if f.Status == "done" {
+				filesToZip = append(filesToZip, f)
+			}
+		}
+		task.mu.Unlock()
+
+		if len(filesToZip) == 0 {
+			now := time.Now()
+			task.mu.Lock()
+			task.Status = StatusFailed
+			task.Error = "No files to zip"
+			task.CompletedAt = &now
+			task.mu.Unlock()
+			return
+		}
+
+		// Tạo ZIP
+		log.Printf("Save task %s: creating ZIP with %d files...", task.ID, len(filesToZip))
+		zipPath := fmt.Sprintf("%s/%s", taskDir, task.ZipName)
+		zipFile, err := os.Create(zipPath)
+		if err != nil {
+			now := time.Now()
+			task.mu.Lock()
+			task.Status = StatusFailed
+			task.Error = fmt.Sprintf("Failed to create ZIP: %v", err)
+			task.CompletedAt = &now
+			task.mu.Unlock()
+			return
+		}
+
+		zw := zip.NewWriter(zipFile)
+		for _, f := range filesToZip {
+			filePath := fmt.Sprintf("%s/%s", taskDir, f.Name)
+			if err := addFileToZip(zw, filePath, f.Name); err != nil {
+				log.Printf("Save task %s: error adding %s to ZIP: %v", task.ID, f.Name, err)
+			}
+		}
+		zw.Close()
+		zipFile.Close()
+
+		// Lấy size ZIP
+		zipInfo, _ := os.Stat(zipPath)
+		var zipSize int64
+		if zipInfo != nil {
+			zipSize = zipInfo.Size()
+		}
+
+		// Xoá file rời, chỉ giữ ZIP
+		for _, f := range filesToZip {
+			os.Remove(fmt.Sprintf("%s/%s", taskDir, f.Name))
+		}
+
+		zipURL := fmt.Sprintf("https://%s/files/%s/%s", task.Host, task.ID, url.PathEscape(task.ZipName))
+
+		now := time.Now()
+		task.mu.Lock()
+		task.ZipURL = zipURL
+		task.ZipSize = zipSize
+		task.Status = StatusDone
+		task.CompletedAt = &now
+		task.mu.Unlock()
+
+		log.Printf("Save task %s: ZIP created - %s (%.2f MB)", task.ID, task.ZipName, float64(zipSize)/1024/1024)
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "zipping",
+		"task_id": req.TaskID,
+	})
+}
+
+// GET /save/status/{task_id}
+func handleSaveStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := path.Base(r.URL.Path)
 
 	tasksMu.RLock()
@@ -278,12 +522,14 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		"task_id":    task.ID,
 		"status":     task.Status,
 		"total":      task.Total,
-		"completed":  task.Completed,
+		"downloaded": task.Downloaded,
 		"failed":     task.Failed,
 		"created_at": task.CreatedAt,
 	}
 	if task.Status == StatusDone {
-		resp["files"] = task.Files
+		resp["zip_url"] = task.ZipURL
+		resp["zip_name"] = task.ZipName
+		resp["zip_size"] = task.ZipSize
 		resp["completed_at"] = task.CompletedAt
 	}
 	if task.Error != "" {
@@ -295,141 +541,32 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func processDownloadTask(task *SaveTask, fileURLs []string, taskDir string, host string) {
-	ctx, cancel := context.WithTimeout(context.Background(), DownloadTimeout)
-	defer cancel()
-
-	usedNames := make(map[string]int)
-	var namesMu sync.Mutex
-
-	// Worker pool
-	type saveFileTask struct {
-		index int
-		url   string
+func addFileToZip(zw *zip.Writer, filePath string, fileName string) error {
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		return err
 	}
 
-	tasks := make(chan saveFileTask, len(fileURLs))
-	for i, u := range fileURLs {
-		tasks <- saveFileTask{index: i, url: u}
+	header := &zip.FileHeader{
+		Name:               fileName,
+		Method:             zip.Store,
+		UncompressedSize64: uint64(fi.Size()),
 	}
-	close(tasks)
+	header.SetModTime(fi.ModTime())
 
-	var wg sync.WaitGroup
-	workers := MaxWorkers
-	if len(fileURLs) < workers {
-		workers = len(fileURLs)
-	}
-
-	type savedResult struct {
-		index int
-		file  *SavedFile
-	}
-	resultsCh := make(chan savedResult, len(fileURLs))
-
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ft := range tasks {
-				fileName, resp, err := getOriginalFileName(ctx, ft.url)
-				if err != nil {
-					log.Printf("Save task %s: failed to download file %d: %v", task.ID, ft.index, err)
-					task.mu.Lock()
-					task.Failed++
-					task.mu.Unlock()
-					resultsCh <- savedResult{index: ft.index, file: nil}
-					continue
-				}
-
-				// Xử lý trùng tên
-				namesMu.Lock()
-				originalName := fileName
-				if count, exists := usedNames[originalName]; exists {
-					ext := path.Ext(fileName)
-					base := fileName[:len(fileName)-len(ext)]
-					fileName = fmt.Sprintf("%s_%d%s", base, count+1, ext)
-				}
-				usedNames[originalName]++
-				namesMu.Unlock()
-
-				// Lưu file vào disk
-				filePath := fmt.Sprintf("%s/%s", taskDir, fileName)
-				f, err := os.Create(filePath)
-				if err != nil {
-					resp.Body.Close()
-					log.Printf("Save task %s: failed to create file: %v", task.ID, err)
-					task.mu.Lock()
-					task.Failed++
-					task.mu.Unlock()
-					resultsCh <- savedResult{index: ft.index, file: nil}
-					continue
-				}
-
-				written, err := io.Copy(f, resp.Body)
-				f.Close()
-				resp.Body.Close()
-
-				if err != nil {
-					os.Remove(filePath)
-					log.Printf("Save task %s: failed to write file: %v", task.ID, err)
-					task.mu.Lock()
-					task.Failed++
-					task.mu.Unlock()
-					resultsCh <- savedResult{index: ft.index, file: nil}
-					continue
-				}
-
-				scheme := "https"
-				fileURL := fmt.Sprintf("%s://%s/files/%s/%s", scheme, host, task.ID, url.PathEscape(fileName))
-
-				task.mu.Lock()
-				task.Completed++
-				log.Printf("Save task %s: downloaded %d/%d - %s", task.ID, task.Completed, task.Total, fileName)
-				task.mu.Unlock()
-
-				resultsCh <- savedResult{
-					index: ft.index,
-					file: &SavedFile{
-						Name: fileName,
-						URL:  fileURL,
-						Size: written,
-					},
-				}
-			}
-		}()
+	w, err := zw.CreateHeader(header)
+	if err != nil {
+		return err
 	}
 
-	wg.Wait()
-	close(resultsCh)
-
-	// Thu thập kết quả theo thứ tự
-	allResults := make([]*SavedFile, len(fileURLs))
-	for r := range resultsCh {
-		if r.file != nil {
-			allResults[r.index] = r.file
-		}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
 	}
+	defer f.Close()
 
-	var files []SavedFile
-	for _, f := range allResults {
-		if f != nil {
-			files = append(files, *f)
-		}
-	}
-
-	now := time.Now()
-	task.mu.Lock()
-	task.Files = files
-	task.CompletedAt = &now
-	if task.Failed == task.Total {
-		task.Status = StatusFailed
-		task.Error = "All files failed to download"
-	} else {
-		task.Status = StatusDone
-	}
-	task.mu.Unlock()
-
-	log.Printf("Save task %s completed: %d/%d files saved", task.ID, len(files), task.Total)
+	_, err = io.Copy(w, f)
+	return err
 }
 
 // ============== HANDLERS ==============
