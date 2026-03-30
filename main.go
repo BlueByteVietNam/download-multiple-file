@@ -22,10 +22,12 @@ import (
 const (
 	SessionTTL      = 1 * time.Hour    // Session hết hạn sau 1 giờ
 	CleanupInterval = 5 * time.Minute  // Cleanup mỗi 5 phút
-	HTTPTimeout     = 60 * time.Minute  // Timeout cho mỗi HTTP request
+	HTTPTimeout     = 60 * time.Minute // Timeout cho mỗi HTTP request
 	DownloadTimeout = 60 * time.Minute // Timeout cho toàn bộ download
 	MaxWorkers      = 10               // Số goroutine download song song
 	MaxPrefetch     = 15               // Tối đa temp files trên disk cùng lúc
+	SavedFilesDir   = "./saved_files"  // Thư mục lưu file tải về
+	TaskTTL         = 1 * time.Hour    // Task hết hạn sau 1 giờ
 )
 
 // ============== TYPES ==============
@@ -57,11 +59,43 @@ type FileResult struct {
 	Err      error
 }
 
+// ============== SAVE TASK TYPES ==============
+
+type SaveTaskStatus string
+
+const (
+	StatusProcessing SaveTaskStatus = "processing"
+	StatusDone       SaveTaskStatus = "done"
+	StatusFailed     SaveTaskStatus = "failed"
+)
+
+type SavedFile struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	Size int64  `json:"size"`
+}
+
+type SaveTask struct {
+	ID          string         `json:"id"`
+	Status      SaveTaskStatus `json:"status"`
+	Total       int            `json:"total"`
+	Completed   int            `json:"completed"`
+	Failed      int            `json:"failed"`
+	Files       []SavedFile    `json:"files,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
+	CompletedAt *time.Time     `json:"completed_at,omitempty"`
+	mu          sync.Mutex
+}
+
 // ============== GLOBAL STATE ==============
 
 var (
 	sessions = make(map[string]*Session)
 	mu       sync.RWMutex
+
+	saveTasks  = make(map[string]*SaveTask)
+	tasksMu    sync.RWMutex
 
 	// HTTP client với timeout
 	httpClient = &http.Client{
@@ -91,11 +125,25 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 // ============== MAIN ==============
 
 func main() {
-	// Khởi động cleanup goroutine
+	// Tạo thư mục lưu file
+	os.MkdirAll(SavedFilesDir, 0755)
+
+	// Khởi động cleanup goroutines
 	go cleanupExpiredSessions()
+	go cleanupExpiredTasks()
 
 	http.HandleFunc("/create", enableCORS(handleCreate))
 	http.HandleFunc("/download/", enableCORS(handleDownload))
+
+	// Async save endpoints
+	http.HandleFunc("/save", enableCORS(handleSave))
+	http.HandleFunc("/status/", enableCORS(handleStatus))
+
+	// Static file server cho saved files
+	fileServer := http.StripPrefix("/files/", http.FileServer(http.Dir(SavedFilesDir)))
+	http.HandleFunc("/files/", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		fileServer.ServeHTTP(w, r)
+	}))
 
 	port := ":6001"
 	log.Printf("Server running on %s (Session TTL: %v, HTTP Timeout: %v)", port, SessionTTL, HTTPTimeout)
@@ -129,6 +177,259 @@ func cleanupExpiredSessions() {
 			log.Printf("Cleaned up %d expired sessions", len(expired))
 		}
 	}
+}
+
+// ============== TASK CLEANUP ==============
+
+func cleanupExpiredTasks() {
+	ticker := time.NewTicker(CleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+		expired := []string{}
+
+		tasksMu.RLock()
+		for id, task := range saveTasks {
+			if now.Sub(task.CreatedAt) > TaskTTL {
+				expired = append(expired, id)
+			}
+		}
+		tasksMu.RUnlock()
+
+		if len(expired) > 0 {
+			tasksMu.Lock()
+			for _, id := range expired {
+				delete(saveTasks, id)
+				// Xoá thư mục file của task
+				os.RemoveAll(fmt.Sprintf("%s/%s", SavedFilesDir, id))
+			}
+			tasksMu.Unlock()
+			log.Printf("Cleaned up %d expired save tasks", len(expired))
+		}
+	}
+}
+
+// ============== SAVE HANDLERS ==============
+
+func handleSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req DownloadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Files) == 0 {
+		http.Error(w, "No files provided", http.StatusBadRequest)
+		return
+	}
+
+	taskID := uuid.New().String()
+	task := &SaveTask{
+		ID:        taskID,
+		Status:    StatusProcessing,
+		Total:     len(req.Files),
+		CreatedAt: time.Now(),
+	}
+
+	// Tạo thư mục cho task
+	taskDir := fmt.Sprintf("%s/%s", SavedFilesDir, taskID)
+	if err := os.MkdirAll(taskDir, 0755); err != nil {
+		http.Error(w, "Failed to create directory", http.StatusInternalServerError)
+		return
+	}
+
+	tasksMu.Lock()
+	saveTasks[taskID] = task
+	tasksMu.Unlock()
+
+	// Bắt đầu download trong background
+	go processDownloadTask(task, req.Files, taskDir, r.Host)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"task_id": taskID,
+		"status":  StatusProcessing,
+		"total":   len(req.Files),
+	})
+
+	log.Printf("Created save task %s with %d files", taskID, len(req.Files))
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	taskID := path.Base(r.URL.Path)
+
+	tasksMu.RLock()
+	task, exists := saveTasks[taskID]
+	tasksMu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Task not found", http.StatusNotFound)
+		return
+	}
+
+	task.mu.Lock()
+	resp := map[string]interface{}{
+		"task_id":    task.ID,
+		"status":     task.Status,
+		"total":      task.Total,
+		"completed":  task.Completed,
+		"failed":     task.Failed,
+		"created_at": task.CreatedAt,
+	}
+	if task.Status == StatusDone {
+		resp["files"] = task.Files
+		resp["completed_at"] = task.CompletedAt
+	}
+	if task.Error != "" {
+		resp["error"] = task.Error
+	}
+	task.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func processDownloadTask(task *SaveTask, fileURLs []string, taskDir string, host string) {
+	ctx, cancel := context.WithTimeout(context.Background(), DownloadTimeout)
+	defer cancel()
+
+	usedNames := make(map[string]int)
+	var namesMu sync.Mutex
+
+	// Worker pool
+	type saveFileTask struct {
+		index int
+		url   string
+	}
+
+	tasks := make(chan saveFileTask, len(fileURLs))
+	for i, u := range fileURLs {
+		tasks <- saveFileTask{index: i, url: u}
+	}
+	close(tasks)
+
+	var wg sync.WaitGroup
+	workers := MaxWorkers
+	if len(fileURLs) < workers {
+		workers = len(fileURLs)
+	}
+
+	type savedResult struct {
+		index int
+		file  *SavedFile
+	}
+	resultsCh := make(chan savedResult, len(fileURLs))
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ft := range tasks {
+				fileName, resp, err := getOriginalFileName(ctx, ft.url)
+				if err != nil {
+					log.Printf("Save task %s: failed to download file %d: %v", task.ID, ft.index, err)
+					task.mu.Lock()
+					task.Failed++
+					task.mu.Unlock()
+					resultsCh <- savedResult{index: ft.index, file: nil}
+					continue
+				}
+
+				// Xử lý trùng tên
+				namesMu.Lock()
+				originalName := fileName
+				if count, exists := usedNames[originalName]; exists {
+					ext := path.Ext(fileName)
+					base := fileName[:len(fileName)-len(ext)]
+					fileName = fmt.Sprintf("%s_%d%s", base, count+1, ext)
+				}
+				usedNames[originalName]++
+				namesMu.Unlock()
+
+				// Lưu file vào disk
+				filePath := fmt.Sprintf("%s/%s", taskDir, fileName)
+				f, err := os.Create(filePath)
+				if err != nil {
+					resp.Body.Close()
+					log.Printf("Save task %s: failed to create file: %v", task.ID, err)
+					task.mu.Lock()
+					task.Failed++
+					task.mu.Unlock()
+					resultsCh <- savedResult{index: ft.index, file: nil}
+					continue
+				}
+
+				written, err := io.Copy(f, resp.Body)
+				f.Close()
+				resp.Body.Close()
+
+				if err != nil {
+					os.Remove(filePath)
+					log.Printf("Save task %s: failed to write file: %v", task.ID, err)
+					task.mu.Lock()
+					task.Failed++
+					task.mu.Unlock()
+					resultsCh <- savedResult{index: ft.index, file: nil}
+					continue
+				}
+
+				scheme := "https"
+				fileURL := fmt.Sprintf("%s://%s/files/%s/%s", scheme, host, task.ID, url.PathEscape(fileName))
+
+				task.mu.Lock()
+				task.Completed++
+				log.Printf("Save task %s: downloaded %d/%d - %s", task.ID, task.Completed, task.Total, fileName)
+				task.mu.Unlock()
+
+				resultsCh <- savedResult{
+					index: ft.index,
+					file: &SavedFile{
+						Name: fileName,
+						URL:  fileURL,
+						Size: written,
+					},
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(resultsCh)
+
+	// Thu thập kết quả theo thứ tự
+	allResults := make([]*SavedFile, len(fileURLs))
+	for r := range resultsCh {
+		if r.file != nil {
+			allResults[r.index] = r.file
+		}
+	}
+
+	var files []SavedFile
+	for _, f := range allResults {
+		if f != nil {
+			files = append(files, *f)
+		}
+	}
+
+	now := time.Now()
+	task.mu.Lock()
+	task.Files = files
+	task.CompletedAt = &now
+	if task.Failed == task.Total {
+		task.Status = StatusFailed
+		task.Error = "All files failed to download"
+	} else {
+		task.Status = StatusDone
+	}
+	task.mu.Unlock()
+
+	log.Printf("Save task %s completed: %d/%d files saved", task.ID, len(files), task.Total)
 }
 
 // ============== HANDLERS ==============

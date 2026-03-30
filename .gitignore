@@ -1,6 +1,10 @@
 # Binaries
 server
+download-multi-file
 *.exe
+
+# Saved files
+saved_files/
 
 # Dependencies
 vendor/
